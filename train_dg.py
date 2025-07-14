@@ -5,6 +5,9 @@ from transformers import CLIPProcessor
 from transformers.models.clip import CLIPModel
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 from tqdm import tqdm
 import os
 import argparse
@@ -30,7 +33,7 @@ class VQADataset(Dataset):
         #image_dir = /data/dacon
         # /data/dacon/image/train_000000.jpg
         img_path = os.path.join(self.image_dir, row['img_path'])
-        #img_path =f"/workspace/clip_vqa_finetuning/{row['img_path']}" 
+        img_path =f"/workspace/clip_vqa_finetuning/{row['img_path']}" 
         image = Image.open(img_path).convert("RGB")
 
         # 모든 선택지 텍스트 구성
@@ -58,24 +61,35 @@ def parse_args():
     parser.add_argument('--image_dir', type=str, default="/data/dacon")
     parser.add_argument('--output_dir', type=str, default="/data/dacon/result")
     parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=5e-6)
     return parser.parse_args()
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
 
 def train(args):
     """VQA를 위한 대조 학습을 사용하여 CLIP 모델을 파인튜닝합니다."""
     # 1. 설정
-    print("학습 설정을 시작합니다...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"사용 장치: {device}")
+    if "LOCAL_RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        print(f"[GPU {local_rank}] 분산 학습 준비 완료")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[싱글 GPU 또는 CPU] 장치 설정 완료: {device}")
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
     # 2. 모델 및 프로세서 로드
     print(f"모델 로드 중: {args.model_name}")
-    model = CLIPModel.from_pretrained(args.model_name,).to(device)
-    processor = CLIPProcessor.from_pretrained(args.model_name)
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14", cache_dir="/data/dacon/hf_cache").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", cache_dir="/data/dacon/hf_cache")
+    if is_distributed():
+            model = DDP(model, device_ids=[local_rank])
+
     # 3. 데이터 로드
     print(f"데이터 로드 중: {args.train_csv_path}")
     if not os.path.exists(args.train_csv_path):
@@ -84,7 +98,9 @@ def train(args):
         
     train_df = pd.read_csv(args.train_csv_path)
     dataset = VQADataset(df=train_df, processor=processor, image_dir=args.image_dir)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    sampler = DistributedSampler(dataset)
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
 
     # 4. 옵티마이저
     optimizer = AdamW(model.parameters(), lr=args.lr)
@@ -94,44 +110,31 @@ def train(args):
     model.train() # 모델을 학습 모드로 설정
 
     for epoch in range(args.epochs):
-        print(f"--- 에포크 {epoch+1}/{args.epochs} ---")
-        total_loss = 0
-        for batch in tqdm(dataloader, desc=f"에포크 {epoch+1} 배치"):
-            # 배치를 장치로 이동
+        sampler.set_epoch(epoch)  # 에포크마다 셔플 재설정
+        total_loss = 0.0
+        for batch in tqdm(dataloader, desc=f"[GPU {local_rank}] 에포크 {epoch+1}"):
             batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch.pop('label') # Shape: (batch_size,)
+            labels = batch.pop("label")
 
-            # 입력 데이터 형태 변경
-            input_ids = batch['input_ids']
-            attention_mask = batch['attention_mask']
-            pixel_values = batch['pixel_values']
-            
-            batch_size = pixel_values.shape[0]
-            num_choices = input_ids.shape[1]
-            
-            # 텍스트 입력의 형태를 (batch_size, num_choices, seq_len) -> (batch_size * num_choices, seq_len)으로 변경
-            input_ids = input_ids.view(batch_size * num_choices, -1)
-            attention_mask = attention_mask.view(batch_size * num_choices, -1)
-            
-            # 순전파
+            input_ids = batch["input_ids"].view(-1, batch["input_ids"].shape[-1])
+            attention_mask = batch["attention_mask"].view(-1, batch["attention_mask"].shape[-1])
+            pixel_values = batch["pixel_values"]
+
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                pixel_values=pixel_values
+                pixel_values=pixel_values,
             )
-            
-            # 각 이미지에 해당하는 4개의 선택지에 대한 로짓만 추출
+
             logits = outputs.logits_per_image
-            
-            # 각 이미지에 대한 올바른 로짓을 선택
+            batch_size = pixel_values.size(0)
+            num_choices = 4
             logits_for_loss = torch.zeros(batch_size, num_choices).to(device)
             for i in range(batch_size):
                 logits_for_loss[i] = logits[i, i*num_choices : (i+1)*num_choices]
-            #logits_for_loss = logits.view(batch_size, num_choices, -1)[:, :, :num_choices]
-            # 손실 함수 계산
+
             loss = torch.nn.functional.cross_entropy(logits_for_loss, labels)
 
-            # 역전파 및 최적화
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -139,13 +142,14 @@ def train(args):
             total_loss += loss.item()
 
         avg_loss = total_loss / len(dataloader)
-        print(f"에포크 {epoch+1} 완료. 평균 손실: {avg_loss:.4f}")
+        if dist.get_rank() == 0:  # 마스터 프로세스만 출력
+            print(f"[GPU {local_rank}] 에포크 {epoch+1} 완료. 평균 손실: {avg_loss:.4f}")
 
     # 6. 모델 저장
-    print(f"학습 완료. 모델을 {args.output_dir}에 저장합니다.")
-    model.save_pretrained(args.output_dir)
-    processor.save_pretrained(args.output_dir)
-    print("모델이 성공적으로 저장되었습니다.")
+    if dist.get_rank() == 0:
+        model.module.save_pretrained(args.output_dir)
+        processor.save_pretrained(args.output_dir)
+        print("모델 저장 완료.")
 
 
 
