@@ -60,6 +60,7 @@ def parse_args():
     parser.add_argument('--train_csv_path', type=str, default="/workspace/clip_vqa_finetuning/train_final.csv")
     parser.add_argument('--image_dir', type=str, default="/data/dacon")
     parser.add_argument('--output_dir', type=str, default="/data/dacon/result")
+    parser.add_argument('--cache', type=str, default="/data/dacon/cvmip/hf_cache")
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=5e-6)
@@ -85,8 +86,8 @@ def train(args):
 
     # 2. 모델 및 프로세서 로드
     print(f"모델 로드 중: {args.model_name}")
-    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14", cache_dir="/data/dacon/hf_cache",local_files_only=True).to(device)
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", cache_dir="/data/dacon/hf_cache",local_files_only=True)
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14", cache_dir=args.cache,local_files_only=True).to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", cache_dir=args.cache,local_files_only=True)
     if is_distributed():
             model = DDP(model, device_ids=[local_rank])
 
