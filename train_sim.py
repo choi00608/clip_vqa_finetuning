@@ -86,8 +86,8 @@ def train(args):
 
     # 2. 모델 및 프로세서 로드
     print(f"모델 로드 중: {args.model_name}")
-    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14", cache_dir=args.cache,local_files_only=True).to(device)
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", cache_dir=args.cache,local_files_only=True)
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
     if is_distributed():
             model = DDP(model, device_ids=[local_rank])
 
