@@ -33,7 +33,7 @@ class VQADataset(Dataset):
         #image_dir = /data/dacon
         # /data/dacon/image/train_000000.jpg
         img_path = os.path.join(self.image_dir, row['img_path'])
-        img_path =f"/workspace/clip_vqa_finetuning/{row['img_path']}" 
+        #img_path =f"/workspace/clip_vqa_finetuning/{row['img_path']}" 
         image = Image.open(img_path).convert("RGB")
 
         # 모든 선택지 텍스트 구성
@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument('--train_csv_path', type=str, default="/workspace/clip_vqa_finetuning/train_final.csv")
     parser.add_argument('--image_dir', type=str, default="/data/dacon")
     parser.add_argument('--output_dir', type=str, default="/data/dacon/result")
-    parser.add_argument('--cache', type=str, default="/data/dacon/cvmip/hf_cache")
+    #parser.add_argument('--cache', type=str, default="/data/dacon/cvmip/hf_cache")
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=5e-6)
@@ -86,8 +86,8 @@ def train(args):
 
     # 2. 모델 및 프로세서 로드
     print(f"모델 로드 중: {args.model_name}")
-    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14", cache_dir=args.cache,local_files_only=True).to(device)
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", cache_dir=args.cache,local_files_only=True)
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
     if is_distributed():
             model = DDP(model, device_ids=[local_rank])
 
@@ -99,9 +99,9 @@ def train(args):
         
     train_df = pd.read_csv(args.train_csv_path)
     dataset = VQADataset(df=train_df, processor=processor, image_dir=args.image_dir)
-    #sampler = DistributedSampler(dataset)
+    sampler = DistributedSampler(dataset)
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size,sampler=sampler)
 
     # 4. 옵티마이저
     optimizer = AdamW(model.parameters(), lr=args.lr)
